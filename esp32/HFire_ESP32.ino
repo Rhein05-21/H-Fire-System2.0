@@ -1,0 +1,215 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFiManager.h> 
+
+// --- HiveMQ Credentials ---
+const char* mqtt_server = "16e51255d95244c2b069b92cf77ebf81.s1.eu.hivemq.cloud";
+const char* mqtt_user = "RheinTigle";
+const char* mqtt_pass = "052105@Rhein";
+
+// --- MQTT Topics (Dynamically generated using MAC) ---
+String topic_data_str;
+String topic_status_str;
+const char* topic_data;
+const char* topic_status;
+
+// --- Pins ---
+const int MQ2_PIN = 34;      // Analog input for Smoke/Gas
+const int FLAME_PIN = 32;    // Digital input for KY-026 Flame Sensor
+const int BUZZER_PIN = 25;   // Digital output for Buzzer
+const int BOOT_BUTTON = 0;   // Built-in ESP32 BOOT button for reset
+
+// --- Thresholds ---
+const int SAFE_LIMIT = 450;
+const int DANGER_LIMIT = 1500;
+
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+String deviceMac = "";
+String shortMac = ""; // Last 5 characters (e.g. 1A:2B without the colon)
+
+// --- WiFi Setup Callbacks ---
+void configModeCallback (WiFiManager *myWiFiManager) {
+  Serial.println("Entered Config Mode");
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi Setup Mode");
+  lcd.setCursor(0, 1);
+  lcd.print("AP: H-Fire-Setup");
+}
+
+void setup_wifi() {
+  WiFiManager wm;
+  wm.setAPCallback(configModeCallback);
+  wm.setConfigPortalTimeout(180);
+
+  if (!wm.autoConnect("H-Fire-Setup")) {
+    Serial.println("Failed to connect / Timeout");
+    lcd.clear();
+    lcd.print("Setup Timeout");
+    delay(3000);
+    ESP.restart();
+  }
+
+  Serial.println("WiFi connected");
+  
+  // Get MAC and format it for topics
+  deviceMac = WiFi.macAddress();
+  deviceMac.replace(":", ""); // Remove colons for easier typing and topics
+  
+  // Create short ID for user linking (last 5 chars of the MAC without colons)
+  shortMac = deviceMac.substring(deviceMac.length() - 5);
+  
+  // Set dynamic topics based on MAC Address
+  topic_data_str = "hfire/" + shortMac + "/data";
+  topic_status_str = "hfire/" + shortMac + "/status";
+  topic_data = topic_data_str.c_str();
+  topic_status = topic_status_str.c_str();
+
+  espClient.setInsecure(); 
+}
+
+// --- MQTT Connection Handling ---
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (digitalRead(BOOT_BUTTON) == LOW) return; 
+
+    if (client.connect(deviceMac.c_str(), mqtt_user, mqtt_pass)) {
+      Serial.println("connected");
+      client.publish(topic_status, "System Online");
+    } else {
+      lcd.setCursor(0, 1);
+      lcd.print("MQTT Retry...");
+      delay(5000);
+    }
+  }
+}
+
+// --- Manual WiFi Reset Logic ---
+void checkManualReset() {
+  if (digitalRead(BOOT_BUTTON) == LOW) {
+    unsigned long startTime = millis();
+    lcd.clear();
+    lcd.print("Release to");
+    lcd.setCursor(0, 1);
+    lcd.print("Disconnect...");
+    
+    while (digitalRead(BOOT_BUTTON) == LOW) {
+      if (millis() - startTime > 3000) {
+        lcd.clear();
+        lcd.print("Resetting WiFi");
+        WiFiManager wm;
+        wm.resetSettings(); 
+        WiFi.disconnect(true, true); 
+        delay(2000);
+        ESP.restart(); 
+      }
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(FLAME_PIN, INPUT); 
+  pinMode(BOOT_BUTTON, INPUT_PULLUP);
+  
+  lcd.init();
+  lcd.backlight();
+  
+  lcd.setCursor(0, 0);
+  lcd.print("H-Fire System");
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+  delay(1000);
+
+  setup_wifi();
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("ID: ");
+  lcd.print(shortMac);
+  lcd.setCursor(0, 1);
+  lcd.print("System Ready");
+  delay(2000);
+  
+  client.setServer(mqtt_server, 8883);
+}
+
+void loop() {
+  checkManualReset();
+
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  // 1. Read Sensors
+  int ppm = analogRead(MQ2_PIN);
+  
+  // LOGIC FIX: Set to HIGH based on your sensor's behavior
+  bool flameDetected = (digitalRead(FLAME_PIN) == HIGH); 
+  
+  String statusMsg;
+  bool buzzerOn = false;
+
+  // 2. Fire Verification Logic
+  if (flameDetected && ppm > DANGER_LIMIT) {
+    statusMsg = "CRITICAL: FIRE"; // Verified by both sensors
+    buzzerOn = true;
+  } 
+  else if (flameDetected) {
+    statusMsg = "WARNING: FLAME"; // Only Flame detected
+    buzzerOn = true;
+  }
+  else if (ppm > DANGER_LIMIT) {
+    statusMsg = "CHECK: HI SMOKE"; // Only Smoke detected
+    buzzerOn = true;
+  }
+  else if (ppm > SAFE_LIMIT) {
+    statusMsg = "CAUTION: SMOKE";
+    // Short beep pattern for minor caution
+    digitalWrite(BUZZER_PIN, HIGH); delay(50); digitalWrite(BUZZER_PIN, LOW);
+  }
+  else {
+    statusMsg = "STATUS: SAFE";
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  // Handle continuous buzzer for high-risk states
+  if (buzzerOn) {
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else if (ppm <= SAFE_LIMIT) {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  // 3. Update LCD with Diagnostic Info
+  lcd.setCursor(0, 0);
+  lcd.print("PPM: "); lcd.print(ppm); lcd.print("    ");
+  
+  // Top-right diagnostic tag: [F!] means fire detected, [OK] means sensor is safe
+  lcd.setCursor(12, 0);
+  if (flameDetected) {
+    lcd.print("[F!]"); 
+  } else {
+    lcd.print("[OK]"); 
+  }
+
+  lcd.setCursor(0, 1);
+  lcd.print(statusMsg); 
+  lcd.print("           "); // Clear old long text
+
+  // 4. Publish Data to HiveMQ
+  String flameStr = flameDetected ? "true" : "false";
+  String dataPayload = "{\"mac\":\"" + shortMac + "\", \"ppm\":" + String(ppm) + ", \"flame\":" + flameStr + "}";
+  client.publish(topic_data, dataPayload.c_str());
+  client.publish(topic_status, statusMsg.c_str());
+
+  delay(1000); 
+}
